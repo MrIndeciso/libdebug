@@ -74,6 +74,8 @@ class PtraceInterface(DebuggingInterface):
         self.lib_trace = _ptrace_cffi.lib
         self.ffi = _ptrace_cffi.ffi
 
+        self.lib_trace.init()
+
         self.context = provide_context(self)
 
         if not self.context.aslr_enabled:
@@ -335,7 +337,17 @@ class PtraceInterface(DebuggingInterface):
             self._global_state, new_thread_id
         )
 
-        register_holder = register_holder_provider(self.context.arch, register_file)
+        fpregister_file = self.lib_trace.get_fpregs_ptr(
+            self._global_state, new_thread_id
+        )
+
+        register_holder = register_holder_provider(
+            self.context.arch,
+            register_file,
+            fpregister_file,
+            self._get_fp_registers,
+            self._set_fp_registers,
+        )
 
         with context_extend_from(self):
             thread = provide_thread_context(self.context.arch, new_thread_id)
@@ -401,6 +413,22 @@ class PtraceInterface(DebuggingInterface):
             breakpoint (Breakpoint): The breakpoint to disable.
         """
         self.lib_trace.disable_breakpoint(self._global_state, breakpoint.address)
+
+    def _get_fp_registers(self, thread: ThreadContext):
+        """Updates the floating-point registers of the specified thread.
+
+        Args:
+            thread (ThreadContext): The thread to update.
+        """
+        self.lib_trace.get_fp_registers(self._global_state, thread.thread_id)
+
+    def _set_fp_registers(self, thread: ThreadContext):
+        """Updates the floating-point registers of the specified thread.
+
+        Args:
+            thread (ThreadContext): The thread to update.
+        """
+        self.lib_trace.set_fp_registers(self._global_state, thread.thread_id)
 
     def set_breakpoint(self, breakpoint: Breakpoint, insert: bool = True):
         """Sets a breakpoint at the specified address.

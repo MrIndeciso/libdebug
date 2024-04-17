@@ -4,7 +4,7 @@
 # Licensed under the MIT license. See LICENSE file in the project root for details.
 #
 
-from libdebug.data.register_holder import PtraceRegisterHolder
+from libdebug.ptrace.ptrace_register_holder import PtraceRegisterHolder
 from libdebug.utils.register_utils import (
     get_reg_8h,
     get_reg_8l,

@@ -8,10 +8,39 @@ import platform
 
 from cffi import FFI
 
+
+base = """
+struct reg_128 {
+    unsigned long s_0;
+    unsigned long s_1;
+};
+
+struct reg_256 {
+    unsigned long s_0;
+    unsigned long s_1;
+    unsigned long s_2;
+    unsigned long s_3;
+};
+
+struct reg_512 {
+    unsigned long s_0;
+    unsigned long s_1;
+    unsigned long s_2;
+    unsigned long s_3;
+    unsigned long s_4;
+    unsigned long s_5;
+    unsigned long s_6;
+    unsigned long s_7;
+};
+"""
+
+
 if platform.machine() == "x86_64":
-    ptrace_user_regs_struct = """
+    ptrace_user_regs_struct = f"""
+    {base}
+
     struct ptrace_user_regs_struct
-    {
+    {{
         unsigned long r15;
         unsigned long r14;
         unsigned long r13;
@@ -39,7 +68,14 @@ if platform.machine() == "x86_64":
         unsigned long es;
         unsigned long fs;
         unsigned long gs;
-    };
+    }};
+
+    struct ptrace_user_fpregs_struct
+    {{
+        unsigned int fpregs_component_size;
+        unsigned int fpregs_avx_offset;
+        char xsave_area[4096];
+    }};
     """
 
     breakpoint_define = """
@@ -48,9 +84,11 @@ if platform.machine() == "x86_64":
     #define BREAKPOINT_SIZE 1
     """
 elif platform.machine() == "i686":
-    ptrace_user_regs_struct = """
+    ptrace_user_regs_struct = f"""
+    {base}
+
     struct ptrace_user_regs_struct
-    {
+    {{
         unsigned long ebx;
         unsigned long ecx;
         unsigned long edx;
@@ -68,7 +106,7 @@ elif platform.machine() == "i686":
         unsigned long eflags;
         unsigned long esp;
         unsigned long xss;
-    };
+    }};
     """
 
     breakpoint_define = """
@@ -77,9 +115,11 @@ elif platform.machine() == "i686":
     #define BREAKPOINT_SIZE 1
     """
 elif platform.machine() == "aarch64":
-    ptrace_user_regs_struct = """
+    ptrace_user_regs_struct = f"""
+    {base}
+
     struct ptrace_user_regs_struct
-    {
+    {{
         unsigned long x0;
         unsigned long x1;
         unsigned long x2;
@@ -114,7 +154,14 @@ elif platform.machine() == "aarch64":
         unsigned long sp;
         unsigned long pc;
         unsigned long pstate;
-    };
+    }};
+
+    struct ptrace_user_fpregs_struct
+    {{
+        struct reg_128 vregs[32];
+        unsigned long fpsr;
+        unsigned long fpcr;
+    }};
     """
 
     breakpoint_define = """
@@ -163,6 +210,7 @@ ffibuilder.cdef(
         _Bool syscall_hooks_enabled;
     };
 
+    void init();
 
     int ptrace_trace_me(void);
     int ptrace_attach(int pid);
@@ -176,6 +224,10 @@ ffibuilder.cdef(
 
     unsigned long ptrace_peekuser(int pid, unsigned long addr);
     unsigned long ptrace_pokeuser(int pid, unsigned long addr, unsigned long data);
+
+    struct ptrace_user_fpregs_struct *get_fpregs_ptr(struct global_state *state, int tid);
+    int get_fp_registers(struct global_state *state, int tid);
+    int set_fp_registers(struct global_state *state, int tid);
 
     unsigned long ptrace_geteventmsg(int pid);
 

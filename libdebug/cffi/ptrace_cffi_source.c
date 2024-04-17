@@ -14,11 +14,30 @@
 #include <sys/user.h>
 #include <sys/wait.h>
 
-#if defined __aarch64__
-#include <elf.h>
-#include <sys/uio.h>
+#if defined __x86_64__
+    #include <cpuid.h>
+    #include <elf.h>
+    #include <sys/uio.h>
 
-#define SIZEOF_STRUCT_HWDEBUG_STATE 8 + (16 * 16)
+    int fpregs_struct_size;
+    int fpregs_avx_offset;
+
+    #ifndef CPUID_LEAF_XSTATE
+        #define CPUID_LEAF_XSTATE 0xd
+    #endif
+
+    #ifndef CPUID_SUBLEAF_XSTATE_FEATURES
+        #define CPUID_SUBLEAF_XSTATE_FEATURES 0x0
+    #endif
+
+    #ifndef CPUID_SUBLEAF_XSTATE_STATE_INFO
+        #define CPUID_SUBLEAF_XSTATE_STATE_INFO 0x2
+    #endif
+#elif defined __aarch64__
+    #include <elf.h>
+    #include <sys/uio.h>
+
+    #define SIZEOF_STRUCT_HWDEBUG_STATE 8 + (16 * 16)
 #endif
 
 struct ptrace_hit_bp {
@@ -39,6 +58,7 @@ struct software_breakpoint {
 struct thread {
     int tid;
     struct ptrace_user_regs_struct regs;
+    struct ptrace_user_fpregs_struct fpregs;
     struct thread *next;
 };
 
@@ -53,6 +73,32 @@ struct global_state {
     struct software_breakpoint *b_HEAD;
     _Bool syscall_hooks_enabled;
 };
+
+
+
+void init()
+{
+#if defined __x86_64__
+    // https://en.wikipedia.org/wiki/CPUID
+
+    unsigned int eax, ebx, ecx, edx;
+
+    // Get the offset of the state component from the start of the xsave area
+    __cpuid_count(CPUID_LEAF_XSTATE, CPUID_SUBLEAF_XSTATE_STATE_INFO, eax, ebx, ecx, edx);
+
+    fpregs_avx_offset = ebx & 0x3fff;
+
+    // Get the size of the state component
+    __cpuid_count(CPUID_LEAF_XSTATE, CPUID_SUBLEAF_XSTATE_FEATURES, eax, ebx, ecx, edx);
+
+    fpregs_struct_size = ecx & 0x3fff;
+
+    if ((fpregs_struct_size + 8) > sizeof(struct ptrace_user_fpregs_struct)) {
+        fprintf(stderr, "AVX configuration not supported\n");
+        return;
+    }
+#endif
+}
 
 int get_registers(int tid, struct ptrace_user_regs_struct *regs)
 {
@@ -75,12 +121,88 @@ int set_registers(int tid, struct ptrace_user_regs_struct *regs)
     return ptrace(PTRACE_SETREGS, tid, NULL, regs);
 #elif defined __aarch64__
     struct iovec iov;
+
     iov.iov_base = regs;
     iov.iov_len = sizeof(struct ptrace_user_regs_struct);
     return ptrace(PTRACE_SETREGSET, tid, NT_PRSTATUS, &iov);
 #else
     #error "Unsupported architecture"
     return 0;
+#endif
+}
+
+int get_fp_registers(struct global_state *state, int tid)
+{
+    struct ptrace_user_fpregs_struct *fpregs = NULL;
+    struct thread *t = state->t_HEAD;
+
+    while (t != NULL) {
+        if (t->tid == tid) {
+            fpregs = &t->fpregs;
+            break;
+        }
+        t = t->next;
+    }
+
+    if (fpregs == NULL)
+        return -1;
+
+#if defined __x86_64__
+    struct iovec iov;
+
+    iov.iov_base = (char*)fpregs + (offsetof(struct ptrace_user_fpregs_struct, xsave_area));
+    iov.iov_len = sizeof(struct ptrace_user_fpregs_struct);
+    iov.iov_len -= offsetof(struct ptrace_user_fpregs_struct, xsave_area);
+
+#ifdef DEBUG
+    fprintf(stderr, "offset: %d\n", offsetof(struct ptrace_user_fpregs_struct, xsave_area));
+    fprintf(stderr, "fpregs: %p\n", fpregs);
+    fprintf(stderr, "iov_base: %p\n", iov.iov_base);
+    fprintf(stderr, "iov_len: %lu\n", iov.iov_len);
+#endif
+
+    long retval = ptrace(PTRACE_GETREGSET, tid, NT_X86_XSTATE, &iov);
+
+#ifdef DEBUG
+    fprintf(stderr, "\nretval: %ld\n", retval);
+    fprintf(stderr, "iov_len: %lu\n", iov.iov_len);
+
+    for (int i = 0; i < iov.iov_len; i++) {
+        fprintf(stderr, "%hhx", ((char *)fpregs)[i]);
+    }
+
+    fprintf(stderr, "a: %p\n", &((char*)fpregs)[8]);
+    fprintf(stderr, "b: %p\n", &((char*)iov.iov_base)[0]);
+#endif
+
+    return retval;
+#endif
+}
+
+int set_fp_registers(struct global_state *state, int tid)
+{
+    struct ptrace_user_fpregs_struct *fpregs = NULL;
+    struct thread *t = state->t_HEAD;
+
+    while (t != NULL) {
+        if (t->tid == tid) {
+            fpregs = &t->fpregs;
+            break;
+        }
+        t = t->next;
+    }
+
+    if (fpregs == NULL)
+        return -1;
+
+#if defined __x86_64__
+    struct iovec iov;
+
+    iov.iov_base = fpregs + offsetof(struct ptrace_user_fpregs_struct, xsave_area);
+    iov.iov_len = sizeof(struct ptrace_user_fpregs_struct);
+    iov.iov_len -= offsetof(struct ptrace_user_fpregs_struct, xsave_area);
+
+    return ptrace(PTRACE_SETREGSET, tid, NT_X86_XSTATE, &iov);
 #endif
 }
 
@@ -96,12 +218,30 @@ struct ptrace_user_regs_struct *register_thread(struct global_state *state, int 
     t = malloc(sizeof(struct thread));
     t->tid = tid;
 
+#if defined __x86_64__
+    t->fpregs.fpregs_component_size = fpregs_struct_size;
+    t->fpregs.fpregs_avx_offset = fpregs_avx_offset;
+#endif
+
     get_registers(tid, &t->regs);
 
     t->next = state->t_HEAD;
     state->t_HEAD = t;
 
     return &t->regs;
+}
+
+struct ptrace_user_fpregs_struct *get_fpregs_ptr(struct global_state *state, int tid)
+{
+    struct thread *t = state->t_HEAD;
+    while (t != NULL) {
+        if (t->tid == tid)
+            return &t->fpregs;
+
+        t = t->next;
+    }
+
+    return NULL;
 }
 
 void unregister_thread(struct global_state *state, int tid)

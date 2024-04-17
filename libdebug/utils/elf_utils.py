@@ -294,4 +294,5 @@ def determine_architecture(path: str) -> str:
         case "AArch64":
             return "aarch64"
         case _:
-            raise ValueError("Architecture not supported.")
+            return "amd64"
+            # raise ValueError("Architecture not supported.")

@@ -25,21 +25,22 @@ from libdebug.utils.libcontext import libcontext
 def register_holder_provider(
     architecture: str,
     register_file: object,
-    getter: Callable[[], object] | None = None,
-    setter: Callable[[object], None] | None = None,
+    fp_register_file: object,
+    fp_getter: Callable[[], None],
+    fp_setter: Callable[[], None],
 ) -> RegisterHolder:
     """Returns an instance of the register holder to be used by the `_InternalDebugger` class."""
     platform = libcontext.platform
 
     match (architecture, platform):
         case "amd64", "x86_64":
-            return Amd64PtraceRegisterHolder(register_file)
+            return Amd64PtraceRegisterHolder(register_file, fp_register_file, fp_getter, fp_setter)
         case "i386", "x86_64":
-            return I386POverAmd64traceRegisterHolder(register_file)
+            return I386POverAmd64traceRegisterHolder(register_file, fp_register_file, fp_getter, fp_setter)
         case "i386", "i686":
-            return I386PtraceRegisterHolder(register_file)
+            return I386PtraceRegisterHolder(register_file, fp_register_file, fp_getter, fp_setter)
         case "aarch64", "aarch64":
-            return Aarch64PtraceRegisterHolder(register_file)
+            return Aarch64PtraceRegisterHolder(register_file, fp_register_file, fp_getter, fp_setter)
         case _:
             raise NotImplementedError(
                 f"Architecture {architecture} on platform {platform} not available."

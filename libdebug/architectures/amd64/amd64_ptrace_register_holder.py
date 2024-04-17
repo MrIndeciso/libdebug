@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass
 
-from libdebug.data.register_holder import PtraceRegisterHolder
+from libdebug.ptrace.ptrace_register_holder import PtraceRegisterHolder
 from libdebug.utils.register_utils import (
     get_reg_8h,
     get_reg_8l,
@@ -164,3 +164,173 @@ class Amd64PtraceRegisterHolder(PtraceRegisterHolder):
         setattr(target_class, "syscall_arg3", get_property_64("r10"))
         setattr(target_class, "syscall_arg4", get_property_64("r8"))
         setattr(target_class, "syscall_arg5", get_property_64("r9"))
+
+        # now for the floating point registers
+        fpregs_size = self.fp_register_file.fpregs_component_size
+
+        match fpregs_size:
+            case 896:
+                self._handle_fpregs_896(target, target_class)
+            case 2560:
+                self._handle_fpregs_2560(target, target_class)
+            case _:
+                raise ValueError(
+                    f"Unsupported floating point register size: {fpregs_size}"
+                )
+
+    def _handle_fpregs_896(self, target, target_class):
+        # standard avx register configuration
+        from cffi import FFI
+
+        ffi = FFI()
+
+        target.fpregs = ffi.buffer(self.fp_register_file, 4096)
+
+        ymm_offset = 8 + self.fp_register_file.fpregs_avx_offset
+        xmm_offset = 8 + 160
+
+        def get_ymm_property(name, offset, ptrace_getter, ptrace_setter):
+            def getter(self):
+                ptrace_getter(self)
+
+                xmm_val = int.from_bytes(
+                    self.fpregs[xmm_offset + offset : xmm_offset + offset + 16],
+                    "little",
+                )
+                ymm_val = int.from_bytes(
+                    self.fpregs[ymm_offset + offset : ymm_offset + offset + 16],
+                    "little",
+                )
+                return ymm_val << 128 | xmm_val
+
+            def setter(self, value):
+                xmm_val = value & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+                ymm_val = value >> 128
+                self.fpregs[xmm_offset + offset : xmm_offset + offset + 16] = (
+                    xmm_val.to_bytes(16, "little")
+                )
+                self.fpregs[ymm_offset + offset : ymm_offset + offset + 16] = (
+                    ymm_val.to_bytes(16, "little")
+                )
+
+                ptrace_setter(self)
+
+            return property(getter, setter, None, name)
+
+        for i in range(16):
+            name = f"ymm{i}"
+            offset = i * 16
+            setattr(
+                target_class,
+                name,
+                get_ymm_property(
+                    name,
+                    offset,
+                    self.fp_get_callback,
+                    self.fp_set_callback,
+                ),
+            )
+
+    def _handle_fpregs_2560(self, target, target_class):
+        self._handle_fpregs_896(target, target_class)
+
+        # avx512 register configuration
+        xmm_offset = 160
+        ymm_offset = 576
+        avx_zmm_0_offset = 1024
+        avx_zmm_1_offset = 1536
+
+        def get_zmm_property_0(name, offset, ptrace_getter, ptrace_setter):
+            def getter(self):
+                ptrace_getter(self)
+
+                xmm_val = int.from_bytes(
+                    self.fpregs[xmm_offset + offset : xmm_offset + offset + 16],
+                    "little",
+                )
+                ymm_val = int.from_bytes(
+                    self.fpregs[ymm_offset + offset : ymm_offset + offset + 16],
+                    "little",
+                )
+                zmm_val = int.from_bytes(
+                    self.fpregs[
+                        avx_zmm_0_offset + (offset * 2) : avx_zmm_0_offset
+                        + (offset * 2)
+                        + 32
+                    ],
+                    "little",
+                )
+                return zmm_val << 256 | ymm_val << 128 | xmm_val
+
+            def setter(self, value):
+                xmm_val = value & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+                ymm_val = (value >> 128) & 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
+                zmm_val = value >> 256
+
+                self.fpregs[xmm_offset + offset : xmm_offset + offset + 16] = (
+                    xmm_val.to_bytes(16, "little")
+                )
+                self.fpregs[ymm_offset + offset : ymm_offset + offset + 16] = (
+                    ymm_val.to_bytes(16, "little")
+                )
+                self.fpregs[
+                    avx_zmm_0_offset + (offset * 2) : avx_zmm_0_offset
+                    + (offset * 2)
+                    + 32
+                ] = zmm_val.to_bytes(32, "little")
+
+                ptrace_setter(self)
+
+            return property(getter, setter, None, name)
+
+        def get_zmm_property_1(name, offset, ptrace_getter, ptrace_setter):
+            def getter(self):
+                ptrace_getter(self)
+
+                zmm_val = int.from_bytes(
+                    self.fpregs[
+                        avx_zmm_1_offset + offset : avx_zmm_1_offset + offset + 64
+                    ],
+                    "little",
+                )
+
+                return zmm_val
+
+            def setter(self, value):
+                zmm_val = value
+
+                self.fpregs[
+                    avx_zmm_1_offset + offset : avx_zmm_1_offset + offset + 64
+                ] = zmm_val.to_bytes(64, "little")
+
+                ptrace_setter(self)
+
+            return property(getter, setter, None, name)
+
+        for i in range(16):
+            name = f"zmm{i}"
+            offset = i * 16
+            setattr(
+                target_class,
+                name,
+                get_zmm_property_0(
+                    name,
+                    offset,
+                    self.fp_get_callback,
+                    self.fp_set_callback,
+                ),
+            )
+
+        for i in range(16, 32):
+            name = f"zmm{i}"
+            offset = i * 64
+            setattr(
+                target_class,
+                name,
+                get_zmm_property_1(
+                    name,
+                    offset,
+                    self.fp_get_callback,
+                    self.fp_set_callback,
+                ),
+            )
