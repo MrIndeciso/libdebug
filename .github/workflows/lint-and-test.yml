@@ -16,6 +16,7 @@ jobs:
   build:
 
     runs-on: ubuntu-latest
+    timetimeout-minutes: 5
     strategy:
       matrix:
         python-version: ["pypy3.10", "3.10", "3.11", "3.12"]
