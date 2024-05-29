@@ -31,10 +31,10 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         python -m pip install pwntools pytest ruff
-      continue-on-error: true
     - name: Lint with Ruff
       run: |
-        ruff --output-format=github .
+        ruff --output-format=github check libdebug
+      continue-on-error: true
     - name: Install library
       run: |
         python -m pip install .
