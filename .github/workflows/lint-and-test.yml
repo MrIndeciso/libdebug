@@ -22,6 +22,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install native dependencies
+      run: |
+        apt install -y libdwarf-dev libelf-dev libiberty-dev linux-headers-generic libc6-dbg
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
       with:
