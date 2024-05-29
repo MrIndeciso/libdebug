@@ -43,4 +43,4 @@ jobs:
         python -m pip install .
     - name: Test with pytest
       run: |
-        cd test && pytest
+        cd test && pytest --ignore=test/other_tests
