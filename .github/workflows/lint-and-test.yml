@@ -36,7 +36,7 @@ jobs:
         python -m pip install pwntools pytest ruff
     - name: Lint with Ruff
       run: |
-        ruff --output-format=github check libdebug
+        ruff check libdebug --output-format=github 
       continue-on-error: true
     - name: Install library
       run: |
