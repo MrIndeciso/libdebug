@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from queue import Queue
 from subprocess import Popen
-from threading import Thread
+from threading import Thread, current_thread
 from typing import Callable
 
 import psutil
@@ -20,6 +20,7 @@ from libdebug.builtin.antidebug_syscall_hook import on_enter_ptrace, on_exit_ptr
 from libdebug.builtin.pretty_print_syscall_hook import pprint_on_enter, pprint_on_exit
 from libdebug.data.breakpoint import Breakpoint
 from libdebug.data.memory_view import MemoryView
+from libdebug.data.signal_hook import SignalHook
 from libdebug.data.syscall_hook import SyscallHook
 from libdebug.interfaces.debugging_interface import DebuggingInterface
 from libdebug.interfaces.interface_helper import provide_debugging_interface
@@ -31,13 +32,20 @@ from libdebug.state.debugging_context import (
     link_context,
     provide_context,
 )
+from libdebug.state.resume_context import ResumeStatus
 from libdebug.state.thread_context import ThreadContext
 from libdebug.utils.libcontext import libcontext
+from libdebug.utils.signal_utils import (
+    get_all_signal_numbers,
+    resolve_signal_name,
+    resolve_signal_number,
+)
 from libdebug.utils.syscall_utils import (
     get_all_syscall_numbers,
     resolve_syscall_name,
     resolve_syscall_number,
 )
+from libdebug.utils.debugger_wrappers import control_flow_function, background_alias
 
 THREAD_TERMINATE = -1
 GDB_GOBACK_LOCATION = str((Path(__file__).parent / "utils" / "gdb.py").resolve())
@@ -72,9 +80,6 @@ class _InternalDebugger:
 
     _polling_thread_response_queue: Queue | None = None
     """The queue used to receive responses from the background thread."""
-
-    _threaded_memory: MemoryView | None = None
-    """The memory view of the process, used for operations in the background thread."""
 
     def __init__(self):
         pass
@@ -139,16 +144,7 @@ class _InternalDebugger:
             liblog.debugger("Enabling anti-debugging escape mechanism.")
             self._enable_antidebug_escaping()
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
-
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
         assert self.context.pipe_manager is not None
 
@@ -166,16 +162,18 @@ class _InternalDebugger:
 
         self._polling_thread_command_queue.put((self.__threaded_attach, (pid,)))
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
+        self._join_and_check_status()
 
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+    def detach(self):
+        """Detaches from the process."""
+        if not self.instanced:
+            raise RuntimeError("Process not running, cannot detach.")
+
+        self._ensure_process_stopped()
+
+        self._polling_thread_command_queue.put((self.__threaded_detach, ()))
+
+        self._join_and_check_status()
 
     def _start_processing_thread(self):
         """Starts the thread that will poll the traced process for state change."""
@@ -187,6 +185,17 @@ class _InternalDebugger:
         )
         self._polling_thread.start()
 
+    def _background_ensure_process_stopped(self):
+        """Validates the state of the process."""
+
+        # In background mode, there shouldn't be anything to do here
+        pass
+
+    def _background_invalid_call(self):
+        """Raises an error when an invalid call is made in background mode."""
+        raise RuntimeError("This method is not available in a callback.")
+
+    @background_alias(_background_ensure_process_stopped)
     def _ensure_process_stopped(self):
         """Validates the state of the process."""
         if not self.instanced:
@@ -200,6 +209,15 @@ class _InternalDebugger:
         if self.context.auto_interrupt_on_command:
             self.context.interrupt()
 
+        self._join_and_check_status()
+
+    def _threads_are_alive(self) -> bool:
+        """Checks if at least one thread is alive."""
+        return any(not thread.dead for thread in self.context.threads)
+
+    def _join_and_check_status(self):
+        # Wait for the background thread to signal "task done" before returning
+        # We don't want any asynchronous behaviour here
         self._polling_thread_command_queue.join()
 
         # Check for any exceptions raised by the background thread
@@ -209,6 +227,7 @@ class _InternalDebugger:
             if response is not None:
                 raise response
 
+    @background_alias(_background_invalid_call)
     def kill(self):
         """Kills the process."""
         try:
@@ -218,51 +237,34 @@ class _InternalDebugger:
 
         self._polling_thread_command_queue.put((self.__threaded_kill, ()))
 
-        self.memory = None
         self.instanced = None
 
         if self.context.pipe_manager is not None:
             self.context.pipe_manager.close()
             self.context.pipe_manager = None
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
-
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
         self.context.clear()
         self.interface.reset()
 
+    @background_alias(_background_invalid_call)
+    @control_flow_function
     def cont(self, auto_wait: bool = True):
         """Continues the process.
 
         Args:
             auto_wait (bool, optional): Whether to automatically wait for the process to stop after continuing. Defaults to True.
         """
-        self._ensure_process_stopped()
 
         self._polling_thread_command_queue.put((self.__threaded_cont, ()))
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
-
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
         if auto_wait:
             self._polling_thread_command_queue.put((self.__threaded_wait, ()))
 
+    @background_alias(_background_invalid_call)
     def interrupt(self):
         """Interrupts the process."""
         if not self.instanced:
@@ -275,48 +277,47 @@ class _InternalDebugger:
 
         self.wait()
 
+    @background_alias(_background_invalid_call)
     def wait(self):
         """Waits for the process to stop."""
         if not self.instanced:
             raise RuntimeError("Process not running, cannot wait.")
 
-        # Wait for the background thread to signal "task done"
-        # Our background might be waiting, and if so we must stop until it's done
-        self._polling_thread_command_queue.join()
-
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
         if self.context.dead:
             raise RuntimeError("Process is dead.")
 
         if not self.context.running:
+            # Most of the time the function returns here, as there was a wait already
+            # queued by the previous command
             return
 
         self._polling_thread_command_queue.put((self.__threaded_wait, ()))
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
+        self._join_and_check_status()
 
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+    def _background_step(self, thread: ThreadContext | None = None):
+        """Executes a single instruction of the process.
 
+        Args:
+            thread (ThreadContext, optional): The thread to step. Defaults to None.
+        """
+        if thread is None:
+            # If no thread is specified, we use the first thread
+            thread = self.threads[0]
+
+        self.__threaded_step(thread)
+        self.__threaded_wait()
+
+    @background_alias(_background_step)
+    @control_flow_function
     def step(self, thread: ThreadContext | None = None):
         """Executes a single instruction of the process.
 
         Args:
             thread (ThreadContext, optional): The thread to step. Defaults to None.
         """
-        self._ensure_process_stopped()
 
         if thread is None:
             # If no thread is specified, we use the first thread
@@ -325,17 +326,35 @@ class _InternalDebugger:
         self._polling_thread_command_queue.put((self.__threaded_step, (thread,)))
         self._polling_thread_command_queue.put((self.__threaded_wait, ()))
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
+        self._join_and_check_status()
 
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+    def _background_step_until(
+        self,
+        position: int | str,
+        thread: ThreadContext | None = None,
+        max_steps: int = -1,
+    ):
+        """Executes instructions of the process until the specified location is reached.
 
+        Args:
+            position (int | bytes): The location to reach.
+            thread (ThreadContext, optional): The thread to step. Defaults to None.
+            max_steps (int, optional): The maximum number of steps to execute. Defaults to -1.
+        """
+
+        if thread is None:
+            # If no thread is specified, we use the first thread
+            thread = self.threads[0]
+
+        if isinstance(position, str):
+            address = self.context.resolve_symbol(position)
+        else:
+            address = self.context.resolve_address(position)
+
+        self.__threaded_step_until(thread, address, max_steps)
+
+    @background_alias(_background_step_until)
+    @control_flow_function
     def step_until(
         self,
         position: int | str,
@@ -349,18 +368,15 @@ class _InternalDebugger:
             thread (ThreadContext, optional): The thread to step. Defaults to None.
             max_steps (int, optional): The maximum number of steps to execute. Defaults to -1.
         """
-        self._ensure_process_stopped()
 
         if thread is None:
             # If no thread is specified, we use the first thread
             thread = self.threads[0]
 
         if isinstance(position, str):
-            with context_extend_from(self):
-                address = self.context.resolve_symbol(position)
+            address = self.context.resolve_symbol(position)
         else:
-            with context_extend_from(self):
-                address = self.context.resolve_address(position)
+            address = self.context.resolve_address(position)
 
         arguments = (
             thread,
@@ -370,17 +386,9 @@ class _InternalDebugger:
 
         self._polling_thread_command_queue.put((self.__threaded_step_until, arguments))
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
+        self._join_and_check_status()
 
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
-
+    @background_alias(_background_invalid_call)
     def breakpoint(
         self,
         position: int | str,
@@ -401,11 +409,9 @@ class _InternalDebugger:
         self._ensure_process_stopped()
 
         if isinstance(position, str):
-            with context_extend_from(self):
-                address = self.context.resolve_symbol(position)
+            address = self.context.resolve_symbol(position)
         else:
-            with context_extend_from(self):
-                address = self.context.resolve_address(position)
+            address = self.context.resolve_address(position)
             position = hex(address)
 
         if condition:
@@ -433,22 +439,14 @@ class _InternalDebugger:
 
         self._polling_thread_command_queue.put((self.__threaded_breakpoint, (bp,)))
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
-
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
         # the breakpoint should have been set by interface
         assert address in self.breakpoints and self.breakpoints[address] is bp
 
         return bp
 
+    @background_alias(_background_invalid_call)
     def watchpoint(
         self,
         position: int | str,
@@ -471,6 +469,121 @@ class _InternalDebugger:
             length=length,
             callback=callback,
         )
+
+    @background_alias(_background_invalid_call)
+    def hook_signal(
+        self,
+        signal: int | str,
+        callback: None | Callable[[ThreadContext, int], None] = None,
+        hook_hijack: bool = True,
+    ) -> SignalHook:
+        """Hooks a signal in the target process.
+
+        Args:
+            signal (int | str): The signal to hook.
+            callback (Callable[[ThreadContext, int], None], optional): A callback to be called when the signal is received. Defaults to None.
+            hook_hijack (bool, optional): Whether to execute the hook/hijack of the new signal after an hijack or not. Defaults to False.
+        """
+        self._ensure_process_stopped()
+
+        if callback is None:
+            raise ValueError("A callback must be specified.")
+
+        if isinstance(signal, str):
+            signal_number = resolve_signal_number(signal)
+        elif isinstance(signal, int):
+            signal_number = signal
+        else:
+            raise ValueError("signal must be an int or a str")
+
+        if signal_number == 9:
+            raise ValueError(
+                "Cannot hook SIGKILL (9) as it cannot be caught or ignored. This is a kernel restriction."
+            )
+        elif signal_number == 19:
+            raise ValueError(
+                "Cannot hook SIGSTOP (19) as it is used by the debugger or ptrace for their internal operations."
+            )
+        elif signal_number == 5:
+            raise ValueError(
+                "Cannot hook SIGTRAP (5) as it is used by the debugger or ptrace for their internal operations."
+            )
+
+        if signal_number in self.context.signal_hooks:
+            liblog.warning(
+                f"Signal {resolve_signal_name(signal_number)} ({signal_number}) is already hooked. Overriding it."
+            )
+            self.unhook_signal(self.context.signal_hooks[signal_number])
+
+        if not isinstance(hook_hijack, bool):
+            raise ValueError("hook_hijack must be a boolean")
+
+        hook = SignalHook(signal_number, callback, hook_hijack)
+
+        link_context(hook, self)
+
+        self._polling_thread_command_queue.put((self.__threaded_signal_hook, (hook,)))
+
+        self._join_and_check_status()
+
+        return hook
+
+    @background_alias(_background_invalid_call)
+    def unhook_signal(self, hook: SignalHook):
+        """Unhooks a signal in the target process.
+
+        Args:
+            hook (SignalHook): The signal hook to unhook.
+        """
+        self._ensure_process_stopped()
+
+        if hook.signal_number not in self.context.signal_hooks:
+            raise ValueError(f"Signal {hook.signal_number} is not hooked.")
+
+        hook = self.context.signal_hooks[hook.signal_number]
+
+        self._polling_thread_command_queue.put((self.__threaded_signal_unhook, (hook,)))
+
+        self._join_and_check_status()
+
+    @background_alias(_background_invalid_call)
+    def hijack_signal(
+        self,
+        original_signal: int | str,
+        new_signal: int | str,
+        hook_hijack: bool = True,
+    ):
+        """
+        Hijacks a signal in the target process.
+
+        Args:
+            original_signal (int | str): The signal to hijack.
+            new_signal (int | str): The signal to replace the original signal with.
+            hook_hijack (bool, optional): Whether to execute the hook/hijack of the new signal after the hijack or not. Defaults to True.
+        """
+
+        self._ensure_process_stopped()
+
+        if isinstance(original_signal, str):
+            original_signal_number = resolve_signal_number(original_signal)
+        else:
+            original_signal_number = original_signal
+
+        if isinstance(new_signal, str):
+            new_signal_number = resolve_signal_number(new_signal)
+        else:
+            new_signal_number = new_signal
+
+        if original_signal_number == new_signal_number:
+            raise ValueError(
+                "The original signal and the new signal must be different during hijacking."
+            )
+
+        def callback(thread: ThreadContext, _: int):
+            """The callback to execute when the signal is received."""
+            thread.signal_number = new_signal_number
+
+        return self.hook_signal(original_signal_number, callback, hook_hijack)
 
     def _enable_pretty_print(
         self,
@@ -511,16 +624,7 @@ class _InternalDebugger:
                         (self.__threaded_syscall_hook, (hook,))
                     )
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
-
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
     def _disable_pretty_print(self):
         """
@@ -538,16 +642,7 @@ class _InternalDebugger:
                     self._polling_thread_command_queue.put(
                         (self.__threaded_syscall_unhook, (hook,))
                     )
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
-
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
     def _enable_antidebug_escaping(self):
         """Enables the anti-debugging escape mechanism."""
@@ -567,6 +662,7 @@ class _InternalDebugger:
         hook._traceme_called = False
         hook._command = None
 
+    @background_alias(_background_invalid_call)
     def hook_syscall(
         self,
         syscall: int | str,
@@ -597,6 +693,9 @@ class _InternalDebugger:
         else:
             syscall_number = syscall
 
+        if not isinstance(hook_hijack, bool):
+            raise ValueError("hook_hijack must be a boolean")
+
         # Check if the syscall is already hooked (by the user or by the pretty print hook)
         if syscall_number in self.context.syscall_hooks:
             hook = self.context.syscall_hooks[syscall_number]
@@ -619,18 +718,11 @@ class _InternalDebugger:
                 (self.__threaded_syscall_hook, (hook,))
             )
 
-            # Wait for the background thread to signal "task done" before returning
-            # We don't want any asynchronous behaviour here
-            self._polling_thread_command_queue.join()
-
-            # Check for any exceptions raised by the background thread
-            if not self._polling_thread_response_queue.empty():
-                response = self._polling_thread_response_queue.get()
-                if response is not None:
-                    raise response
+            self._join_and_check_status()
 
         return hook
 
+    @background_alias(_background_invalid_call)
     def unhook_syscall(self, hook: SyscallHook):
         """Unhooks a syscall in the target process.
 
@@ -652,16 +744,9 @@ class _InternalDebugger:
                 (self.__threaded_syscall_unhook, (hook,))
             )
 
-            # Wait for the background thread to signal "task done" before returning
-            # We don't want any asynchronous behaviour here
-            self._polling_thread_command_queue.join()
+            self._join_and_check_status()
 
-            # Check for any exceptions raised by the background thread
-            if not self._polling_thread_response_queue.empty():
-                response = self._polling_thread_response_queue.get()
-                if response is not None:
-                    raise response
-
+    @background_alias(_background_invalid_call)
     def hijack_syscall(
         self,
         original_syscall: int | str,
@@ -726,15 +811,7 @@ class _InternalDebugger:
                 (self.__threaded_syscall_hook, (hook,))
             )
 
-            # Wait for the background thread to signal "task done" before returning
-            # We don't want any asynchronous behaviour here
-            self._polling_thread_command_queue.join()
-
-            # Check for any exceptions raised by the background thread
-            if not self._polling_thread_response_queue.empty():
-                response = self._polling_thread_response_queue.get()
-                if response is not None:
-                    raise response
+            self._join_and_check_status()
 
         return hook
 
@@ -848,6 +925,34 @@ class _InternalDebugger:
         if self.context._pprint_syscalls:
             self._enable_pretty_print()
 
+    @property
+    def signal_to_pass(self):
+        """Get the signal to pass to the process.
+
+        Returns:
+            list[str]: The signals to pass.
+        """
+        return [resolve_signal_name(v) for v in self.context._signal_to_pass]
+
+    @signal_to_pass.setter
+    def signal_to_pass(self, signals: list[int] | list[str]):
+        """Set the signal to pass to the process.
+
+        Args:
+            value (list[int] | list[str]): The signals to pass.
+        """
+        if not isinstance(signals, list):
+            raise ValueError("signal_to_pass must be a list of integers or strings")
+        signals = [
+            v if isinstance(v, int) else resolve_signal_number(v) for v in signals
+        ]
+
+        if not set(signals).issubset(get_all_signal_numbers()):
+            raise ValueError("Invalid signal number.")
+
+        self.context._signal_to_pass = signals
+
+    @background_alias(_background_invalid_call)
     def migrate_to_gdb(self, open_in_new_process: bool = True):
         """Migrates the current debugging session to GDB."""
         self._ensure_process_stopped()
@@ -856,16 +961,7 @@ class _InternalDebugger:
 
         self._polling_thread_command_queue.put((self.__threaded_migrate_to_gdb, ()))
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
-
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
         if open_in_new_process and libcontext.terminal:
             self._open_gdb_in_new_process()
@@ -877,28 +973,36 @@ class _InternalDebugger:
             self._open_gdb_in_shell()
 
         self._polling_thread_command_queue.put((self.__threaded_migrate_from_gdb, ()))
-        self._polling_thread_command_queue.join()
 
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
         # We have to ignore a SIGSTOP signal that is sent by GDB
         # TODO: once we have signal handling, we should remove this
         self.step()
 
-    def finish(
-        self,
-        thread: ThreadContext | None = None,
-        exact: bool = True
+    def _background_finish(
+        self, thread: ThreadContext | None = None, exact: bool = True
     ):
         """Continues the process until the current function returns or the process stops. When used in step mode,
         it will step until a return instruction is executed. Otherwise, it uses a heuristic
         based on the call stack to breakpoint (exact is slower).
-        
+
+        Args:
+            thread (ThreadContext, optional): The thread to affect. Defaults to None.
+            exact (bool, optional): Whether or not to execute in step mode. Defaults to True.
+        """
+        if thread is None:
+            # If no thread is specified, we use the first thread
+            thread = self.threads[0]
+
+        self.__threaded_finish(thread, exact)
+
+    @background_alias(_background_finish)
+    def finish(self, thread: ThreadContext | None = None, exact: bool = True):
+        """Continues the process until the current function returns or the process stops. When used in step mode,
+        it will step until a return instruction is executed. Otherwise, it uses a heuristic
+        based on the call stack to breakpoint (exact is slower).
+
         Args:
             thread (ThreadContext, optional): The thread to affect. Defaults to None.
             exact (bool, optional): Whether or not to execute in step mode. Defaults to True.
@@ -909,18 +1013,11 @@ class _InternalDebugger:
             # If no thread is specified, we use the first thread
             thread = self.threads[0]
 
-        self._polling_thread_command_queue.put((self.__threaded_finish, (thread,exact)))
+        self._polling_thread_command_queue.put(
+            (self.__threaded_finish, (thread, exact))
+        )
 
-        # Wait for the background thread to signal "task done" before returning
-        # We don't want any asynchronous behaviour here
-        self._polling_thread_command_queue.join()
-
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
     def _craft_gdb_migration_command(self) -> list[str]:
         """Crafts the command to migrate to GDB."""
@@ -969,7 +1066,11 @@ class _InternalDebugger:
         liblog.debugger("Waiting for GDB process to terminate...")
 
         for proc in psutil.process_iter():
-            cmdline = proc.cmdline()
+            try:
+                cmdline = proc.cmdline()
+            except psutil.ZombieProcess:
+                # This is a zombie process, which psutil tracks but we cannot interact with
+                continue
 
             if args == cmdline:
                 gdb_process = proc
@@ -977,7 +1078,10 @@ class _InternalDebugger:
         else:
             raise RuntimeError("GDB process not found.")
 
-        gdb_process.wait()
+        while gdb_process.is_running() and gdb_process.status() != psutil.STATUS_ZOMBIE:
+            # As the GDB process is in a different group, we do not have the authority to wait on it
+            # So we must keep polling it until it is no longer running
+            pass
 
     def _open_gdb_in_shell(self):
         """Open GDB in the current shell."""
@@ -1014,17 +1118,38 @@ class _InternalDebugger:
             thread_context = self.threads[0]
             setattr(thread_context, name, value)
 
+    def __threaded_peek_memory(self, address: int) -> bytes | BaseException:
+        try:
+            value = self.interface.peek_memory(address)
+            # TODO: this is only for amd64
+            return value.to_bytes(8, "little")
+        except BaseException as e:
+            return e
+
+    def __threaded_poke_memory(self, address: int, data: bytes):
+        int_data = int.from_bytes(data, "little")
+        self.interface.poke_memory(address, int_data)
+
+    @background_alias(__threaded_peek_memory)
     def _peek_memory(self, address: int) -> bytes:
         """Reads memory from the process."""
         if not self.instanced:
             raise RuntimeError("Process not running, cannot step.")
 
         if self.context.running:
-            raise RuntimeError("Cannot read memory while the process is running.")
+            # Reading memory while the process is running could lead to concurrency issues
+            # and corrupted values
+            liblog.debugger(
+                "Process is running. Waiting for it to stop before reading memory."
+            )
+
+        self._ensure_process_stopped()
 
         self._polling_thread_command_queue.put(
             (self.__threaded_peek_memory, (address,))
         )
+
+        # We cannot call _join_and_check_status here, as we need the return value which might not be an exception
         self._polling_thread_command_queue.join()
 
         value = self._polling_thread_response_queue.get()
@@ -1035,41 +1160,36 @@ class _InternalDebugger:
 
         return value
 
+    @background_alias(__threaded_poke_memory)
     def _poke_memory(self, address: int, data: bytes) -> None:
         """Writes memory to the process."""
         if not self.instanced:
             raise RuntimeError("Process not running, cannot step.")
 
         if self.context.running:
-            raise RuntimeError("Cannot write memory while the process is running.")
+            # Reading memory while the process is running could lead to concurrency issues
+            # and corrupted values
+            liblog.debugger(
+                "Process is running. Waiting for it to stop before writing to memory."
+            )
+
+        self._ensure_process_stopped()
 
         self._polling_thread_command_queue.put(
             (self.__threaded_poke_memory, (address, data))
         )
-        self._polling_thread_command_queue.join()
 
-        # Check for any exceptions raised by the background thread
-        if not self._polling_thread_response_queue.empty():
-            response = self._polling_thread_response_queue.get()
-            self._polling_thread_response_queue.task_done()
-            if response is not None:
-                raise response
+        self._join_and_check_status()
 
     def _setup_memory_view(self):
         """Sets up the memory view of the process."""
-        self.memory = MemoryView(
-            self._peek_memory,
-            self._poke_memory,
-            self.interface.maps,
-        )
-        self._threaded_memory = MemoryView(
-            self.__threaded_peek_memory,
-            self.__threaded_poke_memory,
-            self.interface.maps,
-        )
+        with context_extend_from(self):
+            self.memory = MemoryView(self._peek_memory, self._poke_memory)
 
         self.context.memory = self.memory
-        self.context._threaded_memory = self._threaded_memory
+
+    def _is_in_background(self):
+        return current_thread() == self._polling_thread
 
     def _polling_thread_function(self):
         """This function is run in a thread. It is used to poll the process for state change."""
@@ -1109,6 +1229,12 @@ class _InternalDebugger:
 
         self.context.set_stopped()
 
+    def __threaded_detach(self):
+        liblog.debugger("Detaching from process %d.", self.context.process_id)
+        self.interface.detach()
+
+        self.context.set_stopped()
+
     def __threaded_kill(self):
         if self.context.argv:
             liblog.debugger(
@@ -1141,9 +1267,19 @@ class _InternalDebugger:
         liblog.debugger(f"Hooking syscall {hook.syscall_number}.")
         self.interface.set_syscall_hook(hook)
 
+    def __threaded_signal_hook(self, hook: SignalHook):
+        liblog.debugger(
+            f"Hooking signal {resolve_signal_name(hook.signal_number)} ({hook.signal_number})."
+        )
+        self.interface.set_signal_hook(hook)
+
     def __threaded_syscall_unhook(self, hook: SyscallHook):
-        liblog.debugger(f"Hooking syscall {hook.syscall_number}.")
+        liblog.debugger(f"Unhooking syscall {hook.syscall_number}.")
         self.interface.unset_syscall_hook(hook)
+
+    def __threaded_signal_unhook(self, hook: SignalHook):
+        liblog.debugger(f"Unhooking syscall {hook.signal_number}.")
+        self.interface.unset_signal_hook(hook)
 
     def __threaded_wait(self):
         if self.context.argv:
@@ -1155,8 +1291,27 @@ class _InternalDebugger:
         else:
             liblog.debugger("Waiting for process %d to stop.", self.context.process_id)
 
-        while self.interface.wait():
-            self.interface.cont()
+        while True:
+            if not self._threads_are_alive():
+                # All threads are dead
+                liblog.debugger("All threads dead")
+                break
+            self.context._resume_context.resume = ResumeStatus.UNDECIDED
+            self.interface.wait()
+            match self.context._resume_context.resume:
+                case ResumeStatus.RESUME:
+                    self.interface.cont()
+                case ResumeStatus.NOT_RESUME:
+                    break
+                case ResumeStatus.UNDECIDED:
+                    if self.context.force_continue:
+                        liblog.warning(
+                            "Stop due to unhandled signal. Trying to continue."
+                        )
+                        self.interface.cont()
+                    else:
+                        liblog.warning("Stop due to unhandled signal. Hanging.")
+                        break
 
         self.context.set_stopped()
 
@@ -1173,24 +1328,12 @@ class _InternalDebugger:
         self.context.set_stopped()
 
     def __threaded_finish(self, thread: ThreadContext, exact: bool):
-        prefix = 'Exact' if exact else 'Heuristic'
-        
+        prefix = "Exact" if exact else "Heuristic"
+
         liblog.debugger(f"{prefix} finish on thread %s", thread.thread_id)
         self.interface.finish(thread, exact=exact)
-        
+
         self.context.set_stopped()
-
-    def __threaded_peek_memory(self, address: int) -> bytes | BaseException:
-        try:
-            value = self.interface.peek_memory(address)
-            # TODO: this is only for amd64
-            return value.to_bytes(8, "little")
-        except BaseException as e:
-            return e
-
-    def __threaded_poke_memory(self, address: int, data: bytes):
-        int_data = int.from_bytes(data, "little")
-        self.interface.poke_memory(address, int_data)
 
     def __threaded_migrate_to_gdb(self):
         self.interface.migrate_to_gdb()
@@ -1206,6 +1349,7 @@ def debugger(
     escape_antidebug: bool = False,
     continue_to_binary_entrypoint: bool = True,
     auto_interrupt_on_command: bool = False,
+    force_continue: bool = True,
 ) -> _InternalDebugger:
     """This function is used to create a new `_InternalDebugger` object. It takes as input the location of the binary to debug and returns a `_InternalDebugger` object.
 
@@ -1215,6 +1359,7 @@ def debugger(
         env (dict[str, str], optional): The environment variables to use. Defaults to the same environment of the debugging script.
         continue_to_binary_entrypoint (bool, optional): Whether to automatically continue to the binary entrypoint. Defaults to True.
         auto_interrupt_on_command (bool, optional): Whether to automatically interrupt the process when a command is issued. Defaults to False.
+        force_continue (bool, optional): Whether to force the process to continue after an unhandled signal is received. Defaults to True.
 
     Returns:
         _InternalDebugger: The `_InternalDebugger` object.
@@ -1237,6 +1382,7 @@ def debugger(
     debugging_context.autoreach_entrypoint = continue_to_binary_entrypoint
     debugging_context.auto_interrupt_on_command = auto_interrupt_on_command
     debugging_context.escape_antidebug = escape_antidebug
+    debugging_context.force_continue = force_continue
 
     debugger._post_init_()
 

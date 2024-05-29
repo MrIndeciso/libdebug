@@ -23,6 +23,7 @@ from libdebug.data.memory_map import MemoryMap
 from libdebug.data.register_holder import RegisterHolder
 from libdebug.data.syscall_hook import SyscallHook
 from libdebug.interfaces.debugging_interface import DebuggingInterface
+from libdebug.data.signal_hook import SignalHook
 from libdebug.liblog import liblog
 from libdebug.ptrace.ptrace_status_handler import PtraceStatusHandler
 from libdebug.state.debugging_context import (
@@ -40,7 +41,7 @@ from libdebug.utils.process_utils import (
     get_process_maps,
     invalidate_process_cache,
 )
-
+from libdebug.state.resume_context import ResumeStatus
 
 JUMPSTART_LOCATION = str(
     (Path(__file__) / ".." / ".." / "ptrace" / "jumpstart" / "jumpstart").resolve()
@@ -68,6 +69,9 @@ class PtraceInterface(DebuggingInterface):
     process_id: int | None
     """The process ID of the debugged process."""
 
+    detached: bool
+    """Whether the process was detached or not."""
+
     def __init__(self):
         super().__init__()
 
@@ -82,6 +86,7 @@ class PtraceInterface(DebuggingInterface):
         self._global_state = self.ffi.new("struct global_state*")
 
         self.process_id = 0
+        self.detached = False
 
         self.hardware_bp_helpers = {}
 
@@ -145,6 +150,7 @@ class PtraceInterface(DebuggingInterface):
         )
 
         self.process_id = child_pid
+        self.detached = False
         self.context.process_id = child_pid
         self.register_new_thread(child_pid)
         continue_to_entry_point = self.context.autoreach_entrypoint
@@ -167,17 +173,37 @@ class PtraceInterface(DebuggingInterface):
             raise OSError(errno_val, errno.errorcode[errno_val])
 
         self.process_id = pid
+        self.detached = False
         self.context.process_id = pid
         self.register_new_thread(pid)
         # If we are attaching to a process, we don't want to continue to the entry point
         # which we have probably already passed
         self._setup_parent(continue_to_entry_point=False)
 
+    def detach(self):
+        """Detaches from the process."""
+        assert self.process_id is not None
+
+        # We must disable all breakpoints before detaching
+        for bp in list(self.context.breakpoints.values()):
+            if bp.enabled:
+                self.unset_breakpoint(bp, delete=True)
+
+        self.lib_trace.ptrace_detach_and_cont(self._global_state, self.process_id)
+
+        self.detached = True
+
     def kill(self):
         """Instantly terminates the process."""
         assert self.process_id is not None
 
-        self.lib_trace.ptrace_detach_all(self._global_state, self.process_id)
+        if not self.detached:
+            self.lib_trace.ptrace_detach_for_kill(self._global_state, self.process_id)
+        else:
+            # If we detached from the process, there's no reason to attempt to detach again
+            # We can just kill the process
+            os.kill(self.process_id, 9)
+            os.waitpid(self.process_id, 0)
 
     def cont(self):
         """Continues the execution of the process."""
@@ -188,7 +214,7 @@ class PtraceInterface(DebuggingInterface):
             bp._disabled_for_step = False
             if bp._changed:
                 changed.append(bp)
-                bp._changed
+                bp._changed = False
 
         for bp in changed:
             if bp.enabled:
@@ -220,6 +246,8 @@ class PtraceInterface(DebuggingInterface):
         if result == -1:
             errno_val = self.ffi.errno
             raise OSError(errno_val, errno.errorcode[errno_val])
+
+        self.context._resume_context.is_a_step = True
 
     def step_until(self, thread: ThreadContext, address: int, max_steps: int):
         """Executes instructions of the specified thread until the specified address is reached.
@@ -339,7 +367,7 @@ class PtraceInterface(DebuggingInterface):
         """
         raise RuntimeError("This method should never be called.")
 
-    def wait(self) -> bool:
+    def wait(self):
         """Waits for the process to stop. Returns True if the wait has to be repeated."""
         result = self.lib_trace.wait_all_and_update_regs(
             self._global_state, self.process_id
@@ -354,11 +382,36 @@ class PtraceInterface(DebuggingInterface):
             results.append((cursor.tid, cursor.status))
             cursor = cursor.next
 
-        repeat = self.status_handler.check_result(results)
+        # Check the result of the waitpid and handle the changes.
+        self.status_handler.manage_change(results)
 
         self.lib_trace.free_thread_status_list(result)
 
-        return repeat
+    def deliver_signal(self, threads: list[int]):
+        """Set the signals to deliver to the threads."""
+        # change the global_state
+        cursor = self._global_state.t_HEAD
+
+        while cursor != self.ffi.NULL:
+            if cursor.tid in threads:
+                thread = self.context.get_thread_by_id(cursor.tid)
+                if thread is None:
+                    # The thread is dead in the meantime
+                    continue
+                if (
+                    thread.signal_number != 0
+                    and thread.signal_number in self.context._signal_to_pass
+                ):
+                    liblog.debugger(
+                        f"Delivering signal {thread.signal_number} to thread {cursor.tid}"
+                    )
+                    # Set the signal to deliver
+                    cursor.signal_to_deliver = thread.signal_number
+                    # Reset the signal to deliver
+                    thread.signal_number = 0
+                    # We have an idea of what is going on, we can resume the thread if possible
+                    self.context._resume_context.resume = ResumeStatus.RESUME
+            cursor = cursor.next
 
     def migrate_to_gdb(self):
         """Migrates the current process to GDB."""
@@ -497,6 +550,22 @@ class PtraceInterface(DebuggingInterface):
             hook (SyscallHook): The syscall hook to unset.
         """
         self.context.remove_syscall_hook(hook)
+
+    def set_signal_hook(self, hook: SignalHook):
+        """Sets a signal hook.
+
+        Args:
+            hook (SignalHook): The signal hook to set.
+        """
+        self.context.insert_new_signal_hook(hook)
+
+    def unset_signal_hook(self, hook: SignalHook):
+        """Unsets a signal hook.
+
+        Args:
+            hook (SignalHook): The signal hook to unset.
+        """
+        self.context.remove_signal_hook(hook)
 
     def peek_memory(self, address: int) -> int:
         """Reads the memory at the specified address."""
