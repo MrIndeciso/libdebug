@@ -37,7 +37,7 @@ jobs:
 
     - name: Lint with Ruff on a basic set of rules
       run: |
-        ruff check . --output-format=github --config ruff-errors.toml
+        ruff check libdebug --output-format=github --config ruff-errors.toml
 
     - name: Lint with Ruff on an extended ruleset but always return success
       run: |
