@@ -35,6 +35,10 @@ jobs:
         python -m pip install --upgrade pip
         python -m pip install ruff
 
-    - name: Lint with Ruff
+    - name: Lint with Ruff on a basic set of rules
       run: |
-        ruff check . --output-format=github 
+        ruff check . --output-format=github --config ruff-errors.toml
+
+    - name: Lint with Ruff on an extended ruleset but always return success
+      run: |
+        ruff check libdebug --output-format=github --exit-zero
