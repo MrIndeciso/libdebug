@@ -8,6 +8,7 @@ on:
     branches: [ "main", "dev" ]
   pull_request:
     branches: [ "main", "dev" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -36,4 +37,4 @@ jobs:
 
     - name: Lint with Ruff
       run: |
-        ruff check libdebug --output-format=github 
+        ruff check . --output-format=github 
