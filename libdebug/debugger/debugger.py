@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from libdebug.data.argument_list import ArgumentList
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 
     from libdebug.commlink.pipe_manager import PipeManager
     from libdebug.data.breakpoint import Breakpoint
+    from libdebug.data.event_type import EventType
     from libdebug.data.gdb_resume_event import GdbResumeEvent
     from libdebug.data.memory_map import MemoryMap
     from libdebug.data.memory_map_list import MemoryMapList
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
     from libdebug.memory.abstract_memory_view import AbstractMemoryView
     from libdebug.snapshots.process.process_snapshot import ProcessSnapshot
     from libdebug.snapshots.snapshot import Snapshot
+    from libdebug.state.resume_context import ResumeContext
     from libdebug.state.thread_context import ThreadContext
 
 
@@ -237,6 +240,27 @@ class Debugger:
             SyscallHandler: The SyscallHandler object.
         """
         return self._internal_debugger.handle_syscall(syscall, on_enter, on_exit, recursive)
+
+    def hook_event(
+        self: Debugger,
+        event: EventType,
+        callback: Callable[[InternalDebugger, ResumeContext], None],
+    ) -> None:
+        """Hooks a callback to a specific event type.
+
+        Args:
+            event (EventType): The event type to hook the callback to.
+            callback (Callable[[InternalDebugger, ResumeContext], None]): The callback to hook to the event.
+        """
+        self._internal_debugger.hook_event(event, callback)
+
+    def unhook_event(self: Debugger, event: EventType) -> None:
+        """Unhooks the callback from a specific event type.
+
+        Args:
+            event (EventType): The event type to unhook the callback from.
+        """
+        self._internal_debugger.unhook_event(event)
 
     def hijack_syscall(
         self: Debugger,
@@ -456,6 +480,25 @@ class Debugger:
 
         self._internal_debugger.argv = value
 
+    @property
+    def current_argv(self: Debugger) -> list[str]:
+        """The current command line arguments of the debugged process, as read from /proc/PID/cmdline."""
+        self._internal_debugger._ensure_process_stopped()
+        if not self._internal_debugger.process_id:
+            raise RuntimeError("The process is not running. Cannot read /proc/PID/cmdline.")
+
+        with Path(f"/proc/{self._internal_debugger.process_id}/cmdline").open("rb") as f:
+            argv = f.read().split(b"\0")
+            if argv[-1] == b"":
+                argv = argv[:-1]
+        return [arg.decode("latin1-") for arg in argv]
+
+    @property
+    def resume_context(self: Debugger) -> ResumeContext:
+        """The current resume context of the debugged process."""
+        self._internal_debugger._ensure_process_stopped()
+        return self._internal_debugger.resume_context
+
     def _configure_env_dict(self: Debugger) -> None:
         """Sets up the EnvDict with the before callback."""
 
@@ -524,6 +567,18 @@ class Debugger:
         # This must be done last, otherwise we might get in an inconsistent state
         # if one of the previous checks fails
         self._internal_debugger._has_path_different_from_argv0 = True
+
+    @property
+    def current_path(self: Debugger) -> str | None:
+        """The current resolved path to the debugged binary, as read from /proc/PID/exe."""
+        self._internal_debugger._ensure_process_stopped()
+        if not self._internal_debugger.process_id:
+            return None
+
+        try:
+            return Path(f"/proc/{self._internal_debugger.process_id}/exe").resolve().as_posix()
+        except Exception as e:
+            raise RuntimeError("Could not resolve /proc/PID/exe. The process might not exist anymore.") from e
 
     @property
     def kill_on_exit(self: Debugger) -> bool:

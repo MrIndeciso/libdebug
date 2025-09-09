@@ -6,14 +6,28 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from libdebug.data.event_type import EventType
 
 if TYPE_CHECKING:
     from libdebug.data.breakpoint import Breakpoint
 
 
+@dataclass
 class ResumeContext:
     """A class representing the context of the resume decision."""
+
+    resume: bool
+    force_interrupt: bool
+    is_a_step: bool
+    is_startup: bool
+    block_on_signal: bool
+    threads_with_signals_to_forward: list[int]
+    event_type: dict[int, EventType]
+    event_hit_ref: dict[int, Breakpoint]
+    is_in_callback: bool
 
     def __init__(self: ResumeContext) -> None:
         """Initializes the ResumeContext."""
@@ -61,20 +75,3 @@ class ResumeContext:
                     event_str += f"{event} on thread {tid}."
 
         return event_str
-
-
-class EventType:
-    """A class representing the type of event that caused the resume decision."""
-
-    UNKNOWN = "Unknown Event"
-    BREAKPOINT = "Breakpoint"
-    SYSCALL = "Syscall"
-    SIGNAL = "Signal"
-    USER_INTERRUPT = "User Interrupt"
-    STEP = "Step"
-    STARTUP = "Process Startup"
-    CLONE = "Thread Clone"
-    FORK = "Process Fork"
-    EXIT = "Process Exit"
-    SECCOMP = "Seccomp"
-    EXEC = "Process Exec"

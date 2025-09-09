@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import os
 import signal
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from libdebug.architectures.ptrace_software_breakpoint_patcher import (
     software_breakpoint_byte_size,
 )
+from libdebug.data.argument_list import ArgumentList
 from libdebug.liblog import liblog
 from libdebug.ptrace.ptrace_constants import SYSCALL_SIGTRAP, StopEvents
 from libdebug.state.resume_context import EventType
@@ -67,9 +69,9 @@ class PtraceStatusHandler:
         # We also need to clear the caches of the debugger
         self.internal_debugger.clear_all_caches()
 
-        # At this point, we are still executing the old binary, stopped before the end
-        # of the execve syscall. All breakpoints, syscall hooks, and signal handlers would
-        # still be valid, but we can clear them now, as they won't be valid after continuing
+        # At this point, we already executing the new binary
+        # All breakpoints, syscall hooks, and signal handlers are not guaranteed to
+        # be valid, so we clear them all
         self.internal_debugger.clear_internal_state()
 
     def _handle_exit(
@@ -468,7 +470,7 @@ class PtraceStatusHandler:
                     )
                     self.forward_signal = False
                     self.internal_debugger.resume_context.event_type[pid] = EventType.EXIT
-                case StopEvents.FORK_EVENT:
+                case StopEvents.FORK_EVENT | StopEvents.VFORK_EVENT:
                     # The process has been forked
                     message = self.ptrace_interface._get_event_msg(pid)
                     liblog.debugger(
@@ -479,7 +481,9 @@ class PtraceStatusHandler:
                     if self.internal_debugger.follow_children:
                         self.internal_debugger.set_child_debugger(message)
                     self.forward_signal = False
+                    # Notify the user that a fork happened
                     self.internal_debugger.resume_context.event_type[pid] = EventType.FORK
+                    self.internal_debugger.resume_context.resume = False
                 case StopEvents.EXEC_EVENT:
                     # The process has executed a new program
                     liblog.debugger(f"Process {pid} executed a new program")

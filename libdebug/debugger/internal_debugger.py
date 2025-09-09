@@ -30,6 +30,7 @@ from libdebug.builtin.pretty_print_syscall_handler import (
 )
 from libdebug.data.argument_list import ArgumentList
 from libdebug.data.breakpoint import Breakpoint
+from libdebug.data.event_type import EventType
 from libdebug.data.gdb_resume_event import GdbResumeEvent
 from libdebug.data.signal_catcher import SignalCatcher
 from libdebug.data.syscall_handler import SyscallHandler
@@ -174,6 +175,9 @@ class InternalDebugger:
     resume_context: ResumeContext
     """Context that indicates if the debugger should resume the debugged process."""
 
+    event_callbacks: dict[EventType, Callable[[InternalDebugger, ResumeContext], None]]
+    """A dictionary of event callbacks, to be called when a specific event occurs."""
+
     debugger: Debugger
     """The debugger object."""
 
@@ -254,6 +258,7 @@ class InternalDebugger:
         self._snapshot_count = 0
         self.serialization_helper = SerializationHelper()
         self.children = []
+        self.event_callbacks = {}
 
         # We register this debugger so that we can clean it up on exit.
         register_internal_debugger(self)
@@ -281,6 +286,7 @@ class InternalDebugger:
         self._is_running = False
         self.resume_context.clear()
         self.children.clear()
+        self.event_callbacks.clear()
 
     def start_up(self: InternalDebugger) -> None:
         """Starts up the context."""
@@ -429,6 +435,8 @@ class InternalDebugger:
         child_internal_debugger.fast_memory = self.fast_memory
         child_internal_debugger.kill_on_exit = self.kill_on_exit
         child_internal_debugger.follow_children = self.follow_children
+        child_internal_debugger.event_callbacks = self.event_callbacks.copy()
+        child_internal_debugger.pprint_syscalls = self.pprint_syscalls
 
         # Create the new Debugger instance for the child process
         child_debugger = Debugger()
@@ -439,6 +447,7 @@ class InternalDebugger:
         # Attach to the child process with the new debugger
         child_internal_debugger.attach(child_pid)
         self.children.append(child_debugger)
+
         liblog.debugger(
             "Child process with pid %d registered to the parent debugger (pid %d)",
             child_pid,
@@ -867,6 +876,31 @@ class InternalDebugger:
                 self.__threaded_handle_syscall(handler)
 
         return handler
+
+    def hook_event(
+        self: InternalDebugger,
+        event: EventType,
+        callback: Callable[[InternalDebugger, ResumeContext], None],
+    ) -> None:
+        """Hooks a callback to a specific event type.
+
+        Args:
+            event (EventType): The event type to hook the callback to.
+            callback (Callable[[InternalDebugger, ResumeContext], None]): The callback to hook to the event.
+        """
+        if event in self.event_callbacks:
+            raise ValueError(f"Event {event} already has a callback hooked.")
+        self.event_callbacks[event] = callback
+
+    def unhook_event(self: InternalDebugger, event: EventType) -> None:
+        """Unhooks the callback from a specific event type.
+
+        Args:
+            event (EventType): The event type to unhook the callback from.
+        """
+        if event not in self.event_callbacks:
+            raise ValueError(f"Event {event} does not have a callback hooked.")
+        del self.event_callbacks[event]
 
     @change_state_function_process
     def hijack_syscall(
@@ -1662,7 +1696,17 @@ class InternalDebugger:
             if self.resume_context.resume:
                 self.debugging_interface.cont()
             else:
-                break
+                # We check if we have an event handler callback registered for this event
+                event_types = self.resume_context.event_type
+                for event_type in event_types.values():
+                    if event_type in self.event_callbacks:
+                        # We call the callback
+                        self.event_callbacks[event_type](self, self.resume_context)
+                # The callback might have changed the resume context, so we check it again
+                if not self.resume_context.resume:
+                    # The callback wants this event to become synchronous
+                    break
+                self.debugging_interface.cont()
 
         self.set_stopped()
 

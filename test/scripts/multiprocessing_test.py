@@ -8,6 +8,7 @@ from unittest import TestCase
 from utils.binary_utils import PLATFORM, BASE, RESOLVE_EXE
 
 from libdebug import debugger
+from libdebug.data.event_type import EventType
 
 match PLATFORM:
     case "amd64":
@@ -34,6 +35,11 @@ class MultiprocessingTest(TestCase):
 
         # Breakpoint after the fork
         bp = d.bp(AFTER_FORK_BASIC, file="binary", hardware=True)
+
+        d.cont()
+
+        print(d.resume_context.event_type)
+        self.assertTrue(d.resume_context.event_type[d.process_id] == EventType.FORK)
 
         d.cont()
         
@@ -66,6 +72,10 @@ class MultiprocessingTest(TestCase):
         bp = d.bp(AFTER_FORK_BASIC, file="binary", hardware=False)
 
         d.cont()
+
+        self.assertTrue(d.resume_context.event_type[d.process_id] == EventType.FORK)
+
+        d.cont()
         
         self.assertTrue(bp.hit_on(d))
         self.assertEqual(len(d.children), 1)
@@ -94,6 +104,10 @@ class MultiprocessingTest(TestCase):
 
         # Breakpoint after the fork in the parent
         bp_parent = d.bp(AFTER_FORK_STRESS, file="binary", hardware=True)
+
+        d.cont()
+
+        self.assertTrue(d.resume_context.event_type[d.process_id] == EventType.FORK)
 
         d.cont()
         
@@ -130,7 +144,7 @@ class MultiprocessingTest(TestCase):
         # The process is already at the breakpoint address (after fork), we need to skip it
         # and wait for the next hit
         ddd.step()
-        
+
         ddd.cont()
         
         self.assertTrue(bp_child2.hit_on(ddd))
